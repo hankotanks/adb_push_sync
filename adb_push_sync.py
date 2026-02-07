@@ -1,56 +1,53 @@
-import argparse
 import os
 import sys
-import subprocess
+import argparse
 import typing
+import collections
+import subprocess
 
-def run_on_device(cmd):
-    if not isinstance(cmd, list): cmd = [cmd]
-    result = subprocess.run(["adb", "shell", *cmd, "&&", "echo", "$?"], 
-        capture_output = True, text = True)
+class Device:
+    def validate():
+        result = subprocess.run(["which", "adb"],
+            stdout = subprocess.DEVNULL,
+            stderr = subprocess.DEVNULL)
 
-    output = result.stdout.strip().split("\n")
-    if len(output) == 0:
-        raise RuntimeError("Unreachable!")
+        if result.returncode != 0:
+            raise RuntimeError("Unable to find adb in PATH!")
 
-    try:
-        exit_code = int(output[-1])
-    except ValueError as e:
-        exit_code = 1
+        result = subprocess.run(["adb", "devices"],
+            capture_output = True,
+            text = True)
 
-    return exit_code, output[:-1]
+        if result.returncode != 0 or len(result.stdout.strip().split("\n")) != 2:
+            raise RuntimeError("Couldn't find device!")
 
-def exists_on_device(path):
-    exit_code, _ = run_on_device([f"[ -e \"{path}\" ]"])
-    return True if exit_code == 0 else False
+    def run(cmd: str | list[str]) -> (int, list[str]):
+        if not isinstance(cmd, list): cmd = [cmd]
+        cmd = ["adb", "shell", *cmd, "&&", "echo", "$?"]
+        result = subprocess.run(cmd, capture_output = True, text = True)
 
-def push_to_device(path_source, path_device):
-    if not isinstance(path_source, list): path_source = [path_source]
-    result = subprocess.run(["adb", "push", *path_source, f"{path_device}"],
-        stdout = sys.stdout, stderr = sys.stderr)
-    if result.returncode != 0:
-        raise RuntimeError(f"Failed to copy file: {entry}")
+        output = result.stdout.strip().split("\n")
+        if len(output) == 0:
+            cmd = " ".join(cmd)
+            raise RuntimeError(f"Failed to run command: {cmd}")
 
-def count_children(path):
-    count = len(os.listdir(path))
-    count_full = 0
-    for _, _, fnames in os.walk(path): count_full += len(fnames)
-    return count, count_full
+        try:
+            exit_code = int(output[-1])
+        except ValueError as e:
+            exit_code = 1
 
-def count_children_on_device(path):
-    exit_code, output = run_on_device(["ls", "-l", f"\"{path}\""])
-    if exit_code != 0:
-        raise RuntimeError(f"Failed to query directory: {path}")
+        return exit_code, output[:-1]
+    
+    def exists(path: str) -> bool:
+        exit_code, _ = Device.run([f"[ -e \"{path}\" ]"])
+        return True if exit_code == 0 else False
 
-    count = len(output)
-
-    exit_code, output = run_on_device(["ls", "-lR", f"\"{path}\"", "|", "grep", "'^-'"])
-    if exit_code != 0:
-        raise RuntimeError(f"Failed to query directory: {path}")
-
-    count_full = len(output)
-
-    return count, count_full
+    def push(path_source: str, path_device: str):
+        if not isinstance(path_source, list): path_source = [path_source]
+        result = subprocess.run(["adb", "push", *path_source, f"{path_device}"],
+            stdout = sys.stdout, stderr = sys.stderr)
+        if result.returncode != 0:
+            raise RuntimeError(f"Failed to copy file: {entry}")
 
 class Entry(typing.NamedTuple):
     stub: str
@@ -59,36 +56,48 @@ class Entry(typing.NamedTuple):
     child_dirnames: list[str]
     child_fnames: list[str]
 
-    def exists_on_device(self):
-        exit_code, _ = run_on_device([f"[ -e \"{self.path_device}\" ]"])
-        return True if exit_code == 0 else False
+    def count_children_on_device(self, recurse: bool = False, regex: str | None = None) -> int:
+        exit_code, output = Device.run([
+            "ls", "-l", 
+            *(["-R"] if recurse else []), 
+            f"\"{self.path_device}\"",
+            *(["|", "grep", f"'{regex}'"] if regex is not None else [])])
 
-    def count_children(self):
+        if exit_code != 0:
+            raise RuntimeError(f"Failed to query entry on device: {self.stub}")
+
+        return len(output)
+
+    # returns True when the entry should be added to the skip list
+    def sync(self) -> bool:
+        if not Device.exists(self.path_device):
+            Device.push(self.path_source, self.path_device)
+            return True
+
+        if self.count_children_on_device() == 0:
+            Device.push(self.path_source, os.path.dirname(self.path_device))
+            return True
+
+        fnames_to_push = []
+        for fname in self.child_fnames:
+            if Device.exists(os.path.join(self.path_device, fname)): continue
+            fnames_to_push.append(os.path.join(self.path_source, fname))
+        
+        if len(fnames_to_push) > 0:
+            Device.push(fnames_to_push, entry.path_device)
+
         count_source = len(os.listdir(self.path_source))
+        count_device = self.count_children_on_device(recurse = True, regex = "^-")
 
-        exit_code, output = run_on_device(["ls", "-l", f"\"{self.path_device}\""])
-        if exit_code != 0:
-            raise RuntimeError(f"Failed to query entry on device: {self.stub}")
+        return count_source == count_device        
 
-        count_device = len(output)
-
-        return count_source, count_device
-
-    def count_children_recursive(self):
-        count_source = 0
-        for _, _, fnames in os.walk(self.path_source): count_source += len(fnames)
-
-        exit_code, output = run_on_device(["ls", "-lR", f"\"{self.path_device}\"", "|", "grep", "'^-'"])
-        if exit_code != 0:
-            raise RuntimeError(f"Failed to query entry on device: {self.stub}")
-
-        count_device = len(output)
-
-        return count_source, count_device
-
-def walk(path_source, path_device, topdown = True):
+def walk_root(path_source: str, path_device: str, topdown: bool = True) -> collections.abc.Iterator[Entry]:
     for dirpath, dirnames, filenames in os.walk(path_source, topdown = topdown):
+        if len(dirnames) == 0 and len(filenames) == 0: continue
+
         stub = dirpath.removeprefix(path_source).lstrip("/")
+        if len(stub) == 0: continue
+
         yield Entry(
             stub = stub, 
             path_source = dirpath,
@@ -97,66 +106,55 @@ def walk(path_source, path_device, topdown = True):
             child_fnames = filenames)
 
 if __name__ == "__main__":
+    try:
+        Device.validate()
+    except Exception as e:
+        print(f"{e}")
+        exit(1)
+
     parser = argparse.ArgumentParser()
     parser.add_argument("source")
     parser.add_argument("destination")
 
     args = parser.parse_args()
     if not os.path.exists(args.source):
-        raise ValueError("Provided <source> path does not exist: {args.source}")
+        print(f"Provided <source> path does not exist: {args.source}")
 
-    result = subprocess.run(["which", "adb"],
-        stdout = subprocess.DEVNULL,
-        stderr = subprocess.DEVNULL)
-
-    if result.returncode != 0:
-        raise RuntimeError("Unable to find adb in PATH!")
-
-    result = subprocess.run(["adb", "devices"],
-        capture_output = True,
-        text = True)
-
-    if result.returncode != 0 or len(result.stdout.strip().split("\n")) != 2:
-        raise RuntimeError("Couldn't find device!")
-
-    if not exists_on_device(args.destination):
-        raise ValueError(f"Provided <destination> path does not exist: {args.destination}")
+    try:
+        if not Device.exists(args.destination):
+            print(f"Provided <destination> path does not exist: {args.destination}")
+            exit(1)
+    except Exception as e:
+        print(f"{e}")
+        exit(1)
 
     path_source = args.source.rstrip("/")
     path_device = os.path.join(args.destination, os.path.basename(path_source))
 
-    if not exists_on_device(path_device):
-        push_to_device(path_source, args.destination)
-        exit(0)
+    try:
+        if not Device.exists(path_device):
+            Device.push(path_source, args.destination)
+            exit(0)
+    except Exception as e:
+        print(f"{e}")
+        exit(1)
 
     entries_to_skip = set()
-    entries = []
-    for entry in walk(path_source, path_device):
-        if len(entry.child_dirnames) == 0 and len(entry.child_fnames) == 0: continue
-
-        if len(entry.stub) == 0: continue
+    failed = 0
+    for entry in walk_root(path_source, path_device):
         if any(entry.stub.startswith(skip) for skip in entries_to_skip): continue
-
-        if not entry.exists_on_device():
-            push_to_device(entry.path_source, entry.path_device)
-            entries_to_skip.add(entry.stub)
-            continue
-
-        count_source, count_device = entry.count_children()
-        count_full_source, count_full_device = entry.count_children_recursive()
-        if count_device == 0:
-            push_to_device(entry.path_source, os.path.dirname(entry.path_device))
-            entries_to_skip.add(entry.stub)
-            continue
-
-        if count_full_source == count_full_device:
-            entries_to_skip.add(entry.stub)
-            continue
-
-        entry_child_fnames_missing = []
-        for fname in entry.child_fnames:
-            if exists_on_device(os.path.join(entry.path_device, fname)): continue
-            entry_child_fnames_missing.append(os.path.join(entry.path_source, fname))
         
-        if len(entry_child_fnames_missing) > 0:
-            push_to_device(entry_child_fnames_missing, entry.path_device)
+        try:
+            if entry.sync():
+                entries_to_skip.add(entry.stub)
+        except Exception as e:
+            print(f"{e}")
+            print(f"{entry.stub}")
+            failed += 1
+
+    if failed == 0:
+        print("Success!")
+    else:
+        print(f"Failed to sync {failed} entries!")
+        exit(1)
+        
