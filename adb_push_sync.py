@@ -2,12 +2,10 @@ import argparse
 import os
 import sys
 import subprocess
-import datetime
-import tqdm
-import pathlib
-import re
+import typing
 
 def run_on_device(cmd):
+    if not isinstance(cmd, list): cmd = [cmd]
     result = subprocess.run(["adb", "shell", *cmd, "&&", "echo", "$?"], 
         capture_output = True, text = True)
 
@@ -26,33 +24,12 @@ def exists_on_device(path):
     exit_code, _ = run_on_device([f"[ -e \"{path}\" ]"])
     return True if exit_code == 0 else False
 
-"""
-def getmtime_on_device(path):
-    exit_code, result = run_on_device(["ls", "-l",  f"{path}"])
-    print(result)
-    return None
-    if exit_code != 0 or len(result) < 2: 
-        return None
-
-    cols = result[-1].split()
-    if len(cols) == 0:
-        return None
-
-    is_file = cols[0][0] == '-'
-    if len(cols) < (6 if is_file else 5): 
-        return None
-
-    time_str = " ".join(cols[4:6] if is_file else cols[3:5])
-    return datetime.datetime.strptime(time_str, "%Y-%m-%d %H:%M").timestamp()
-"""
-
-def listing_on_device(path):
-    exit_code, output = run_on_device(["ls", "-l", f"\"{path}\"", "|", "grep", "'^-'"])
-    print(output)
-    if exit_code != 0:
-        raise RuntimeError(f"Failed to query directory: {path}")
-
-    return list(map(lambda line: line.split(maxsplit = 6)[6], output))
+def push_to_device(path_source, path_device):
+    if not isinstance(path_source, list): path_source = [path_source]
+    result = subprocess.run(["adb", "push", *path_source, f"{path_device}"],
+        stdout = sys.stdout, stderr = sys.stderr)
+    if result.returncode != 0:
+        raise RuntimeError(f"Failed to copy file: {entry}")
 
 def count_children(path):
     count = len(os.listdir(path))
@@ -74,6 +51,50 @@ def count_children_on_device(path):
     count_full = len(output)
 
     return count, count_full
+
+class Entry(typing.NamedTuple):
+    stub: str
+    path_source: str
+    path_device: str
+    child_dirnames: list[str]
+    child_fnames: list[str]
+
+    def exists_on_device(self):
+        exit_code, _ = run_on_device([f"[ -e \"{self.path_device}\" ]"])
+        return True if exit_code == 0 else False
+
+    def count_children(self):
+        count_source = len(os.listdir(self.path_source))
+
+        exit_code, output = run_on_device(["ls", "-l", f"\"{self.path_device}\""])
+        if exit_code != 0:
+            raise RuntimeError(f"Failed to query entry on device: {self.stub}")
+
+        count_device = len(output)
+
+        return count_source, count_device
+
+    def count_children_recursive(self):
+        count_source = 0
+        for _, _, fnames in os.walk(self.path_source): count_source += len(fnames)
+
+        exit_code, output = run_on_device(["ls", "-lR", f"\"{self.path_device}\"", "|", "grep", "'^-'"])
+        if exit_code != 0:
+            raise RuntimeError(f"Failed to query entry on device: {self.stub}")
+
+        count_device = len(output)
+
+        return count_source, count_device
+
+def walk(path_source, path_device, topdown = True):
+    for dirpath, dirnames, filenames in os.walk(path_source, topdown = topdown):
+        stub = dirpath.removeprefix(path_source).lstrip("/")
+        yield Entry(
+            stub = stub, 
+            path_source = dirpath,
+            path_device = os.path.join(path_device, stub),
+            child_dirnames = dirnames,
+            child_fnames = filenames)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -105,49 +126,37 @@ if __name__ == "__main__":
     path_device = os.path.join(args.destination, os.path.basename(path_source))
 
     if not exists_on_device(path_device):
-        result = subprocess.run(["adb", "push", path_source, args.destination], 
-            stdout = sys.stdout, stderr = sys.stderr)
-        if result.returncode != 0:
-            raise RuntimeError("Failed to perform initial sync!")
+        push_to_device(path_source, args.destination)
         exit(0)
 
     entries_to_skip = set()
     entries = []
-    for entry_source, children_dirname, children_fname in os.walk(path_source, topdown = True):
-        if len(children_dirname) == 0 and len(children_fname) == 0: continue
+    for entry in walk(path_source, path_device):
+        if len(entry.child_dirnames) == 0 and len(entry.child_fnames) == 0: continue
 
-        entry = entry_source.removeprefix(path_source).lstrip("/")
-        if len(entry) == 0: continue
-        if any(entry.startswith(skip) for skip in entries_to_skip): continue
+        if len(entry.stub) == 0: continue
+        if any(entry.stub.startswith(skip) for skip in entries_to_skip): continue
 
-        entry_device = os.path.join(path_device, entry)
-        if not exists_on_device(entry_device):
-            result = subprocess.run(["adb", "push", f"{entry_source}", f"{entry_device}"],
-                stdout = sys.stdout, stderr = sys.stderr)
-            if result.returncode != 0:
-                raise RuntimeError(f"Failed to copy file: {entry}")
-            
-            entries_to_skip.add(entry)
-        else:
-            count_source, count_full_source = count_children(entry_source)
-            count_device, count_full_device = count_children_on_device(entry_device)
-            if count_device == 0:
-                result = subprocess.run(["adb", "push", f"{entry_source}", f"{os.path.dirname(entry_device)}"],
-                    stdout = sys.stdout, stderr = sys.stderr)
-                if result.returncode != 0:
-                    raise RuntimeError(f"Failed to copy file: {entry}")
-                
-                entries_to_skip.add(entry)
-            elif count_full_source == count_full_device:
-                entries_to_skip.add(entry)
-            else:
-                children_fname_missing = []
-                for f in children_fname:
-                    if exists_on_device(os.path.join(entry_device, f)): continue
-                    children_fname_missing.append(os.path.join(entry_source, f))
-                
-                if len(children_fname_missing) > 0:
-                    result = subprocess.run(["adb", "push", *children_fname_missing, f"{entry_device}"],
-                        stdout = sys.stdout, stderr = sys.stderr)
-                    if result.returncode != 0:
-                        raise RuntimeError(f"Failed to copy file: {entry}")
+        if not entry.exists_on_device():
+            push_to_device(entry.path_source, entry.path_device)
+            entries_to_skip.add(entry.stub)
+            continue
+
+        count_source, count_device = entry.count_children()
+        count_full_source, count_full_device = entry.count_children_recursive()
+        if count_device == 0:
+            push_to_device(entry.path_source, os.path.dirname(entry.path_device))
+            entries_to_skip.add(entry.stub)
+            continue
+
+        if count_full_source == count_full_device:
+            entries_to_skip.add(entry.stub)
+            continue
+
+        entry_child_fnames_missing = []
+        for fname in entry.child_fnames:
+            if exists_on_device(os.path.join(entry.path_device, fname)): continue
+            entry_child_fnames_missing.append(os.path.join(entry.path_source, fname))
+        
+        if len(entry_child_fnames_missing) > 0:
+            push_to_device(entry_child_fnames_missing, entry.path_device)
